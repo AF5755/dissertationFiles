@@ -1,0 +1,206 @@
+
+
+```{r}
+setRepositories(ind=1:2)
+library(Seurat)
+library(Signac)
+library(GenomeInfoDb)
+library(tidyverse)
+
+#remove(NucSeq.rna)
+
+#read in bc matrix and correspodning metadata
+counts <- Read10X_h5("GSE174367_snATAC-seq_filtered_peak_bc_matrix.h5")
+snATACmeta <- read.csv("GSE174367_snATAC-seq_cell_meta.csv.gz", header=TRUE)
+
+
+#file.exists("~/R/dissertation/preprocessing/fragments.tsv.gz")
+#file.exists(paste0("~/R/dissertation/preprocessing/fragments.tsv.gz", '.tbi'))
+snATACmeta <- as.data.frame(snATACmeta)
+rownames(snATACmeta) <- snATACmeta$Barcode
+
+
+
+chrom_assay <- CreateChromatinAssay(
+  counts = counts,
+  sep = c(":", "-"),
+  genome = 'hg38',
+  fragments = '~/R/dissertation/preprocessing/fragments.tsv.gz',
+  min.cells = 1
+)
+
+#create Seurat object and store path to fragment file
+NucSeq.atac <-  CreateSeuratObject(
+  counts=chrom_assay,
+  assay="peaks",
+  meta.data=snATACmeta,
+  
+)
+
+#fragment.path <- "fragments.tsv.gz"
+#NucSeq.atac <- SetFragments(NucSeq.atac, file = fragment.path)
+
+#binarise the peaks
+NucSeq.atac@assays$peaks@counts@x[NucSeq.atac@assays$peaks@counts@x > 0] <- 1
+
+
+
+all.equal(rownames(snATACmeta), colnames(chrom_assay))
+NucSeq.atac <- AddMetaData(NucSeq.atac, metadata=snATACmeta)
+#NucSeq.atac <- AddMetaData(NucSeq.atac, metadata=my.data)
+#LOOK TO CHANGE THE ABOVE TO INCORPORATE METADAT PROPERLY BEFORE CONTINUING
+
+NucSeq.atac[['peaks']]
+
+head(NucSeq.atac)
+
+```
+
+
+```{r}
+library(EnsDb.Hsapiens.v86)
+# extract gene annotations from EnsDb
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+#seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "hg38"
+Annotation(NucSeq.atac) <- annotations
+
+
+#change fast argument to plot accessibility profile (more memory used) 
+
+NucSeq.atac<- TSSEnrichment(
+  object = NucSeq.atac,
+  #tss.positions = NULL,
+  n = NULL,
+  fast = FALSE,
+  cells = NULL,
+  verbose = TRUE
+)
+
+
+#look at nucleosome signal docs check why error Done Processing 44 million lines[1] NA Error: No cells found, chekc barcode numbers to sampel number maybe
+#sort annotations maybe look to extra data to find peak region frags etc 
+
+chrom.sizes = read.csv('hg38.chrom.sizes', sep='\t', header=F)
+colnames(chrom.sizes) <- c('chr', 'size')
+NucSeq.atac$nucleosome_signal <- NA
+NucSeq.atac$nucleosome_group <- NA
+samples <- unique(NucSeq.atac$Sample.ID)
+for(i in 1:length(samples)){
+  print(samples[i])
+  temp <- NucleosomeSignal(
+    subset(NucSeq.atac, Sample.ID == samples[i]),
+    region=paste0(chrom.sizes[1,][[1]],"-1-",chrom.sizes[1,][[2]])
+  )
+  temp$nucleosome_group <- ifelse(temp$nucleosome_signal > 10, 'NS > 10', 'NS < 10')
+  NucSeq.atac$nucleosome_signal <- ifelse(NucSeq.atac$Sample.ID == samples[i], temp$nucleosome_signal, NucSeq.atac$nucleosome_signal)
+  NucSeq.atac$nucleosome_group <- ifelse(NucSeq.atac$Sample.ID == samples[i], temp$nucleosome_group, NucSeq.atac$nucleosome_group)
+}
+NucSeq.atac$pass_qc <- ifelse(NucSeq.atac$peak_region_fragments > 300 & NucSeq.atac$peak_region_fragments < 10000 & NucSeq.atac$pct_reads_in_peaks > 15 & NucSeq.atac$blacklist_ratio < 0.01 & NucSeq.atac$nucleosome_signal < 10, TRUE, FALSE)
+NucSeq.atac <- NucSeq.atac[,NucSeq.atac$pass_qc]
+
+
+
+NucSeq.atac<- TSSEnrichment(object = NucSeq.atac, fast = FALSE)
+
+
+
+
+NucSeq.atac$pct_reads_in_peaks <- NucSeq.atac$peak_region_fragments / NucSeq.atac$passed_filters * 100
+NucSeq.atac$blacklist_ratio <- NucSeq.atac$blacklist_region_fragments / NucSeq.atac$peak_region_fragments
+
+
+
+NucSeq.atac$pct_reads_in_peaks <- NucSeq.atac$peak_region_fragments / NucSeq.atac$nCount_peaks * 100
+NucSeq.atac$blacklist_ratio <- NucSeq.atac$blacklist_region_fragments / NucSeq.atac$peak_region_fragments
+```
+
+
+```{r}
+AD_degs <- c()
+for(cur_celltype in c('ASC', 'EX', 'INH', 'MG', 'ODC', 'OPC')){
+  cur_degs <- celltype.diagnosis.markers %>%
+    subset(cluster == 'AD' & avg_logFC >= 0)
+  cur_degs <- cur_degs[grepl(cur_celltype, cur_degs$celltype),]
+  # which modules are associated with this celltype?
+  cur_modules <- top_modules_df %>% subset(celltype == cur_celltype) %>% .$module %>% unique
+  cur_links <- top_links_sorted %>% subset(NMF_module %in% cur_modules)
+  # genes that are in these modules and are degs for this celltype:
+  cur_degs <- cur_degs %>% subset(gene %in% cur_links$Peak1_nearestGene)
+  # top genes in each cluster:
+  cur_degs <- cur_degs %>% group_by(celltype) %>% top_n(5, wt=avg_logFC) %>% .$gene %>% unique
+  AD_degs <- c(AD_degs, cur_degs)
+}
+AD_degs <- unique(AD_degs)
+# set up labels
+AD_degs_indices <- c()
+AD_degs_labels <- c()
+for(gene in AD_degs[!(AD_degs %in% genes.to.exclude)]){
+  # boolean array to index rows where this gene is present
+  gene_index <- grepl(gene, as.character(top_links_sorted$Peak1_nearestGene))
+  gene_index <- (1:nrow(top_links_sorted))[gene_index]
+  # sample to only 3 occurrences if there are more than 3
+  if(length(gene_index) > 3){
+    gene_index <- sample(gene_index, 3)
+  }
+  # indices:
+  AD_degs_indices <- c(AD_degs_indices, gene_index)
+  # labels:
+  AD_degs_labels <- c(AD_degs_labels, rep(gene, length(gene_index)))
+}
+table(AD_degs_labels)[rev(order(as.numeric(table(AD_degs_labels))))]
+length(AD_degs_labels)
+ha = rowAnnotation(
+  foo = anno_mark(
+    at = AD_degs_indices, labels = AD_degs_labels
+```
+
+
+```{r}
+))
+library(EnsDb.Hsapiens.v86)
+gene.coords <- genes(EnsDb.Hsapiens.v86, filter = ~ gene_biotype == "protein_coding")
+seqlevelsStyle(gene.coords) <- 'UCSC'
+genebody.coords <- keepStandardChromosomes(gene.coords, pruning.mode = 'coarse')
+genebodyandpromoter.coords <- Extend(x = gene.coords, upstream = 2000, downstream = 0)
+gene.activities <- FeatureMatrix(
+  fragments = fragment.path,
+  features = genebodyandpromoter.coords,
+  cells = colnames(NucSeq.atac),
+  chunk = 10
+)
+gene.key <- genebodyandpromoter.coords$gene_name
+names(gene.key) <- GRangesToString(grange = genebodyandpromoter.coords)
+rownames(gene.activities) <- gene.key[rownames(gene.activities)]
+NucSeq.atac[['RNA']] <- CreateAssayObject(counts = gene.activities)
+NucSeq.atac <- NormalizeData(
+  object = NucSeq.atac,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(NucSeq.atac$nCount_RNA)
+)
+DefaultAssay(NucSeq.atac) <- 'RNA'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+

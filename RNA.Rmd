@@ -1,0 +1,472 @@
+```{r}
+setRepositories(ind=1:2)
+library(Seurat)
+library(Signac)
+library(GenomeInfoDb)
+library(tidyverse)
+
+
+NucSeq.data <- Read10X_h5("GSE174367_snRNA-seq_filtered_feature_bc_matrix.h5")
+NucSeq.rna <- CreateSeuratObject(
+  counts = NucSeq.data,
+  min.cells = 3,
+  min.features = 200
+)
+
+#remove(NucSeq.data)
+head(NucSeq.rna@meta.data, 5)
+
+# add sample level metadata (Diagnosis, Age, Sex, etc)
+my.data <- read.csv(file = "GSE174367_snRNA-seq_cell_meta.csv.gz", header=TRUE)
+my.data <- as.data.frame(my.data)
+rownames(my.data) <- my.data$Barcode
+my.data <- my.data[rownames(my.data) %in% colnames(NucSeq.rna),]
+NucSeq.rna <- AddMetaData(NucSeq.rna, metadata=my.data)
+NucSeq.rna$BRcode_sample <- paste0(do.call('rbind', strsplit(NucSeq.rna$Barcode, "-"))[,1], "-", do.call("rbind", strsplit(as.character(NucSeq.rna$SampleID), "-"))[,2])
+```
+
+
+```{r}
+#QC controls
+NucSeq.rna[["percent.mt"]] <- PercentageFeatureSet(object = NucSeq.rna, pattern = "^MT-")
+NucSeq.rna <- subset(x = NucSeq.rna, subset = nFeature_RNA > 200 & nFeature_RNA < 10000 & percent.mt < 10)
+NucSeq.rna <- NucSeq.rna[!grepl("^MT-", rownames(NucSeq.rna)),]
+
+
+#do batch correction etc then jujst use base assay list sorted by AD, cluster, find the associated TF's and target genes etc
+
+# Visualize QC metrics as a violin plot
+VlnPlot(NucSeq.rna, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+#DISPLAYING WEIRDLY NEED TO FIX
+
+
+```
+
+
+```{r}
+library(plyr)
+library(rliger)
+library(liger)
+library(Matrix)
+library(patchwork)
+library (ggplot2)
+library(dplyr)
+library(cowplot)
+library(Seurat)
+library(Signac)
+library(GenomeInfoDb)
+library(tidyverse)
+
+SeuratList <- list(
+  b1 = GetAssayData(subset(NucSeq.rna, Batch == 1), slot="counts"),
+  b2 = GetAssayData(subset(NucSeq.rna, Batch == 2), slot="counts"),
+  b3 = GetAssayData(subset(NucSeq.rna, Batch == 3), slot="counts")
+)
+
+a.NucSeq <- createLiger(SeuratList, format.type = "HDF5")
+a.NucSeq <- liger::normalize(a.NucSeq)
+a.NucSeq <- selectGenes(a.NucSeq, var.thresh =0.4, do.plot=T)
+a.NucSeq <- scaleNotCenter(a.NucSeq)
+a.NucSeq <- optimizeALS(a.NucSeq, k=30)
+a.NucSeq <- quantileAlignSNF(a.NucSeq, resolution = 1.0, small.clust.thresh = 20)
+
+MergeSparseDataAll <- function(datalist, library.names = NULL) {
+  col_offset <- 0
+  allGenes <- unique(unlist(lapply(datalist, rownames)))
+  allCells <- c()
+  for (i in 1:length(datalist)) {
+    curr <- datalist[[i]]
+    curr_s <- summary(curr)
+  curr_s[, 2] <- curr_s[, 2] + col_offset
+
+    if (!is.null(library.names)) {
+      cellnames <- paste0(library.names[i], "_", colnames(curr))
+    } else {
+      cellnames <- colnames(curr)
+    }
+    allCells <- c(allCells, cellnames)
+    idx <- match(rownames(curr), allGenes)
+    newgenescurr <- idx[curr_s[, 1]]
+    curr_s[, 1] <- newgenescurr
+    if (!exists("full_mat")) {
+      full_mat <- curr_s
+    } else {
+      full_mat <- rbind(full_mat, curr_s)
+    }
+    col_offset <- length(allCells)
+  }
+  M <- sparseMatrix(
+    i = full_mat[, 1],
+    j = full_mat[, 2],
+    x = full_mat[, 3],
+    dims = c(
+      length(allGenes),
+      length(allCells)
+    ),
+    dimnames = list(
+      allGenes,
+      allCells
+    )
+  )
+  return(M)
+}
+
+
+customLigerToSeurat <- function(liger_object){
+  raw.data <- MergeSparseDataAll(liger_object@raw.data, names(liger_object@H))
+  scale.data <- do.call(rbind, liger_object@scale.data)
+  rownames(scale.data) <- colnames(raw.data)
+  var.genes <- liger_object@var.genes
+  var.genes <- gsub("_", replacement = "-", var.genes)
+   inmf.obj <- new(Class = "DimReduc", feature.loadings = t(liger_object@W),
+       cell.embeddings = liger_object@H.norm, key = "iNMF_")
+  inmf.obj <- CreateDimReducObject(
+    loadings=t(liger_object@W),
+    embeddings=liger_object@H.norm,
+    key="iNMF_",
+    assay="RNA"
+  )
+  rownames(inmf.obj@feature.loadings) <- var.genes
+  rownames(inmf.obj@cell.embeddings) <- rownames(scale.data)
+  new.seurat <- CreateSeuratObject(raw.data)
+  new.seurat@assays$RNA@var.features <- var.genes
+  new.seurat <- SetAssayData(new.seurat, slot = "scale.data",
+             t(scale.data), assay = "RNA")
+  new.seurat@reductions$inmf <- inmf.obj
+  return(new.seurat)
+}
+# colnames for cell embeddings not set in above 
+#remove(a.NucSeq)
+NucSeq.rna <- customLigerToSeurat(a.NucSeq)
+my.data <- read.csv(file = "GSE174367_snRNA-seq_cell_meta.csv.gz", header=TRUE)
+my.data <- as.data.frame(my.data)
+rownames(my.data) <- my.data$Barcode
+
+for(meta in names(my.data)){
+  print(meta)
+  NucSeq.rna@meta.data[[meta]] <- my.data[[meta]]
+}
+
+NucSeq.rna <- NormalizeData(NucSeq.rna)
+NucSeq.rna <- FindVariableFeatures(NucSeq.rna)
+NucSeq.rna <- ScaleData(NucSeq.rna, block.size = 50) #features=rownames(NucSeq.rna))
+NucSeq.rna <- RunPCA(NucSeq.rna, dims=1:100)
+NucSeq.rna <- RunUMAP(NucSeq.rna, reduction = "inmf", dims = 1:dim(NucSeq.rna[["inmf"]])[2])
+NucSeq.rna <- RunTSNE(NucSeq.rna, reduction = "inmf", dims = 1:dim(NucSeq.rna[["inmf"]])[2])
+NucSeq.rna <- FindNeighbors(NucSeq.rna, reduction = "inmf", dims = 1:dim(NucSeq.rna[["inmf"]])[2], nn.eps=0.5)
+NucSeq.rna <- FindClusters(NucSeq.rna, resolution = 0.90, n.start=10)
+#remove(seurat_obj)
+```
+
+
+```{r}
+library(clustifyr)
+
+#convert seuratobject RNA assay to matrix in csv file with row names as genes and columns as barcode samples 
+#write.table(as.matrix(GetAssayData(object = seurat.obj, slot = "counts")), 
+#            '/your/path/to/store/csv/counts.csv', 
+ #           sep = ',', row.names = T, col.names = T, quote = F)
+
+#
+#ExpMat1 <- seurat_ref(meta.data, cluster_col = "cluster", var_genes_only = FALSE, assay_name= "Diagnosis", method = "mean", subclusterpower = 0, if_log = FALSE)
+
+
+
+
+
+
+
+
+
+
+
+
+head(NucSeq.rna)
+```
+
+
+```{r}
+
+library(tidyverse)
+library(Seurat)
+library(ggplot2)
+library(Matrix)
+library(ggrepel)
+library(grid)
+library(gridExtra)
+library(ggpubr)
+library(reshape2)
+library(RColorBrewer)
+# load seurat object
+#NucSeq <- readRDS("celltype-analysis/data/NucSeq_batch_correct_seurat.rds")
+
+cur_celltypes <- c('INH', 'EX')
+name = 'neuronal'
+w=4; h=6;
+cur_celltypes <- c('ASC', 'MG')
+name = 'glia'
+w=4; h=6;
+cur_celltypes <- c('ODC', 'OPC')
+name = 'oligo'
+w=4; h=7;
+seurat_obj <- subset(NucSeq.rna, Cell.Type %in% cur_celltypes)
+meta_list <- seurat_obj@meta.data %>%
+  dplyr::group_split(SampleID)
+temp <- lapply(meta_list, function(meta){
+  print(table(meta$Diagnosis))
+  df <- as.data.frame(meta$cluster %>% table / nrow(meta))
+  colnames(df) <- c('cluster', 'proportion')
+  df$SampleID <- paste0(unique(meta$Diagnosis), '_', unique(meta$SampleID))
+  df$Diagnosis <- unique(meta$Diagnosis)
+  df
+})
+proportion_df <- Reduce(rbind, temp)
+proportion_df$cluster_num <- as.numeric(proportion_df$cluster)
+# relevel for ODCs;
+proportion_df$cluster<- factor(
+  as.character(proportion_df$cluster),
+  levels=c('OPC1', 'OPC2', 'ODC13', 'ODC8', 'ODC12', 'ODC10', 'ODC5', 'ODC3', 'ODC7', 'ODC6', 'ODC11', 'ODC2', 'ODC9', 'ODC1', 'ODC4')
+)
+proportion_df$cluster_num <- as.numeric(proportion_df$cluster)
+
+
+
+# box plot
+p <- ggplot(proportion_df, aes(y=proportion, x=reorder(cluster, -cluster_num), fill=Diagnosis)) +
+  geom_boxplot(outlier.shape=NA, color='black') +
+  coord_flip() +
+  theme(
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    legend.position="bottom",
+  ) + xlab('')
+pdf(paste0('figures/', name, '_composition_boxplot.pdf'), width=w, height=h)
+p
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```
+```{r}
+
+library(tidyverse)
+library(Seurat)
+library(ggplot2)
+library(Matrix)
+library(ggrepel)
+library(grid)
+library(gridExtra)
+library(ggpubr)
+library(reshape2)
+library(RColorBrewer)
+
+
+
+seurat_obj <- subset(NucSeq.rna, Cell.Type == cur_celltype)
+meta_list <- seurat_obj@meta.data %>%
+  dplyr::group_split(SampleID)
+temp <- lapply(meta_list, function(meta){
+  print(table(meta$Diagnosis))
+  df <- as.data.frame(meta$monocle_clusters_umap_ID %>% table / nrow(meta))
+  colnames(df) <- c('cluster', 'proportion')
+  df$SampleID <- paste0(unique(meta$Dataset), '_', unique(meta$SampleID))
+  df$Diagnosis <- unique(meta$Diagnosis)
+  df
+})
+proportion_df <- Reduce(rbind, temp)
+proportion_df$cluster_num <- as.numeric(str_replace_all(proportion_df$cluster, cur_celltype, ''))
+
+
+cur_celltypes <- c('ODC', 'OPC')
+name = 'oligo'
+w=4; h=7;
+seurat_obj <- subset(NucSeq.rna, Cell.Type %in% cur_celltypes)
+meta_list <- seurat_obj@meta.data %>%
+  dplyr::group_split(SampleID)
+temp <- lapply(meta_list, function(meta){
+  print(table(meta$Diagnosis))
+  df <- as.data.frame(meta$cluster %>% table / nrow(meta))
+  colnames(df) <- c('cluster', 'proportion')
+  df$SampleID <- paste0(unique(meta$Diagnosis), '_', unique(meta$SampleID))
+  df$Diagnosis <- unique(meta$Diagnosis)
+  df
+})
+proportion_df <- Reduce(rbind, temp)
+proportion_df$cluster_num <- as.numeric(proportion_df$cluster)
+# relevel for ODCs;
+proportion_df$cluster<- factor(
+  as.character(proportion_df$cluster),
+  levels=c('OPC1', 'OPC2', 'ODC13', 'ODC8', 'ODC12', 'ODC10', 'ODC5', 'ODC3', 'ODC7', 'ODC6', 'ODC11', 'ODC2', 'ODC9', 'ODC1', 'ODC4')
+)
+proportion_df$cluster_num <- as.numeric(proportion_df$cluster)
+# box plot
+p <- ggplot(proportion_df, aes(y=proportion, x=reorder(cluster, -cluster_num), fill=Diagnosis)) +
+  geom_boxplot(outlier.shape=NA, color='black') +
+  coord_flip() +
+ stat_compare_means(method='wilcox.test', label='p.signif') +
+  theme(
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    legend.position="bottom",
+  ) + xlab('')
+  ylim(c(0, 0.4))
+
+p
+
+
+
+```
+
+```{r}
+library(tidyverse)
+library(Seurat)
+library(ggplot2)
+library(Matrix)
+library(ggrepel)
+library(grid)
+library(gridExtra)
+library(ggpubr)
+library(reshape2)
+library(RColorBrewer)
+
+
+# dot plot of top 5 markers in each cluster:
+cluster.markers$cluster <- factor(as.character(cluster.markers$cluster), levels=unique(as.character(cluster.markers$cluster))[order(unique(as.character(cluster.markers$cluster)))])
+# re-order factors by developmental trajectory:
+top_degs <- cluster.markers[as.logical(grepl('ODC', cluster.markers$cluster) + grepl('OPC', cluster.markers$cluster)),]
+top_degs <- top_degs %>%
+  group_by(cluster) %>%
+  top_n(25, wt=avg_logFC)
+length(unique(top_degs$gene))
+expression_matrix <- AverageExpression(cur_seurat, features=unique(top_degs$gene))
+expression_matrix <- expression_matrix$RNA
+# convert to Z score
+zScore <- function(x){(x - mean(x)) /sd(x)}
+matrix_z <- apply(expression_matrix, 1, zScore) %>% t()
+matrix_z <- matrix_z[,order(colnames(matrix_z))]
+library(circlize)
+col_fun = colorRamp2(c(range(matrix_z)[1], 0, range(matrix_z)[2]), c("blue", "white", "red"))
+cn = colnames(matrix_z)
+# set row annotation as selected genes:
+# set annotation list
+gene_anno_list <- top_degs %>% top_n(1, wt=avg_logFC) %>% .$gene %>% unique
+more_gene_list <- c('SOX6', 'TPST1', 'ITPR2', 'CLU', 'RBFOX1','OLIG2', 'KLK6', 'OLIG1', 'MOG', 'OPALIN',  'ABCA6','APOLD1', 'PLP1', 'CNP', "MOBP", 'NEAT1' )
+gene_anno_list <- c(gene_anno_list, more_gene_list) %>% unique
+gene_anno_list <- gene_anno_list[gene_anno_list %in% rownames(matrix_z)]
+ha = rowAnnotation(foo = anno_mark(at = unlist(lapply(gene_anno_list, function(gene){which(rownames(matrix_z) == gene)})), labels = gene_anno_list))
+head(rownames(matrix_z))
+# hierarchical clustering:
+row_dend = dendsort(hclust(dist(matrix_z)))
+col_dend = dendsort(hclust(dist(t(matrix_z))))
+# plot heatmap
+pdf('figures/ODC/top25_degs_expression_heatmap.pdf', width=5, height=5)
+ComplexHeatmap::Heatmap(
+  matrix_z, show_column_names = FALSE, show_row_names=FALSE,
+  col = col_fun,
+  cluster_rows=row_dend,
+  bottom_annotation = HeatmapAnnotation(
+      text = anno_text(cn, rot = 45, location = unit(1, "npc"), just = "right"),
+      annotation_height = max_text_width(cn)
+  ),
+  right_annotation = ha
+)
+
+pca <- RunPCA(NucSeq.rna, features = VariableFeatures(object = NucSeq.rna))
+UMAP <- RunUMAP(NucSeq.rna, dims = 1:10)
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+``{r}
+setRepositories(ind=1:2)
+library(plyr)
+library(rliger)
+library(Matrix)
+library(patchwork)
+library (ggplot2)
+library(dplyr)
+library(cowplot)
+library(Seurat)
+library(Signac)
+library(GenomeInfoDb)
+library(tidyverse)
+
+#remove(counts)
+#not necessary unless combining with other rna dataset
+library(cicero)
+        
+        
+seurat_list <- list()
+k = 50
+celltypes <- unique(NucSeq.joint$Cell.Type)
+celltypes <- celltypes[celltypes != 'PER.END']
+for(cur_celltype in celltypes){
+  condition_list <- list()
+  for(condition in unique(NucSeq.joint$Diagnosis)){
+    print(paste(cur_celltype, condition))
+    cur_seurat <- subset(NucSeq.joint, Cell.Type == cur_celltype & Diagnosis == condition)
+    expr_matrix <- GetAssayData(cur_seurat, slot='data')
+    genes <- data.frame(as.character(rownames(expr_matrix)))
+    rownames(genes) <- rownames(expr_matrix)
+    genes <- as.data.frame(cbind(genes,genes))
+    colnames(genes) <- c("GeneSymbol", "gene_short_name")
+    cds <- new_cell_data_set(
+      expr_matrix,
+      cell_metadata=cur_seurat@meta.data,
+      gene_metadata=genes
+    )
+    cds@reducedDims[['UMAP']] <- cur_seurat@reductions$umap@cell.embeddings
+    umap_coords <- reducedDims(cds)$UMAP
+    metacell_cds <- make_cicero_cds(cds, reduced_coordinates=umap_coords, k=k, size_factor_normalize=FALSE)
+    metacell_seurat <- CreateSeuratObject( 
+      counts = exprs(metacell_cds) / k,
+    metacell_seurat$Cell.Type <- cur_celltype,
+    metacell_seurat$Diagnosis <- condition,
+    metacell_seurat <- RenameCells(metacell_seurat, new.names=paste0(cur_celltype, '_', condition, '_', seq(1:ncol(metacell_seurat))))
+    condition_list[[condition]] <- metacell_seurat,
+  }
+  seurat_list[[cur_celltype]] <- merge(condition_list[[1]], y=condition_list[2:length(condition_list)])
+}
+metacell_seurat <- merge(x=seurat_list[[1]], y=seurat_list[2:length(seurat_list)])
+metacell_seurat <- FindVariableFeatures(metacell_seurat, nfeatures=3000)
+metacell_seurat <- ScaleData(metacell_seurat, features = VariableFeatures(metacell_seurat))
+metacell_seurat <- RunPCA(metacell_seurat, features=VariableFeatures(metacell_seurat))
+metacell_seurat <- RunUMAP(metacell_seurat, reduction='pca', dims=1:25)
+
+
+
+
+
+
+```
+

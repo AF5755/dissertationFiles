@@ -1,0 +1,148 @@
+```{r}
+
+NucSeq.rna <- readRDS('data/snRNA.rds')
+NucSeq.rna$tech <- 'rna'; NucSeq.atac$tech <- 'atac';
+DefaultAssay(NucSeq.atac) <- 'RNA'
+
+
+# compute anchors between RNA and ATAC
+transfer.anchors <- FindTransferAnchors(
+ reference=NucSeq.rna,
+ query=NucSeq.atac,
+ features=VariableFeatures(NucSeq.rna),
+ reference.assay="RNA",
+ query.assay="RNA",
+ reduction="cca",
+ verbose=T,
+ dims=1:40
+)
+celltype.predictions <- TransferData(
+  anchorset=transfer.anchors,
+  refdata=NucSeq.rna$Cell.Type,
+  weight.reduction=NucSeq.atac[["lsi"]]
+)
+NucSeq.atac <- AddMetaData(NucSeq.atac, celltype.predictions)
+NucSeq.atac$predicted.id <- factor(NucSeq.atac$predicted.id, levels = levels(as.factor(NucSeq.rna$Cell.Type)))
+Idents(NucSeq.atac) <- NucSeq.atac$monocle_clusters_umap_Cell.Type
+Idents(NucSeq.rna) <- NucSeq.rna$Cell.Type
+Idents(NucSeq.atac) <- paste0(Idents(NucSeq.atac), 'atac')
+Idents(NucSeq.rna) <- paste0(Idents(NucSeq.rna), 'rna')
+genes.use <- VariableFeatures(NucSeq.rna)
+refdata <- GetAssayData(NucSeq.rna, assay = "RNA", slot = "data")[genes.use, ]
+imputation <- TransferData(anchorset = transfer.anchors, refdata = refdata, weight.reduction = NucSeq.atac[["lsi"]])
+NucSeq.atac[["RNA"]] <- imputation
+NucSeq.atac <- RenameCells(NucSeq.atac, add.cell.id='atac')
+NucSeq.rna <- RenameCells(NucSeq.rna, add.cell.id='rna')
+NucSeq.coembed <- merge(x = NucSeq.rna, y = NucSeq.atac)
+cells_to_keep <- c(colnames(NucSeq.rna), colnames(NucSeq.atac)[NucSeq.atac$prediction.score.max >= 0.5])
+NucSeq.coembed <- NucSeq.coembed[,cells_to_keep]
+NucSeq.coembed <- ScaleData(NucSeq.coembed, features = genes.use, do.scale = FALSE)
+NucSeq.coembed <- RunPCA(NucSeq.coembed, features = rownames(NucSeq.coembed), verbose = FALSE)
+NucSeq.coembed <- RunUMAP(NucSeq.coembed, dims = 1:30)
+expr_matrix <- GetAssayData(NucSeq.coembed, slot='data', assay='RNA')
+genes <- data.frame(as.character(rownames(expr_matrix)))
+rownames(genes) <- rownames(expr_matrix)
+genes <- as.data.frame(cbind(genes,genes))
+colnames(genes) <- c("GeneSymbol", "gene_short_name")
+NucSeq_cds <- new_cell_data_set(
+  expr_matrix,
+  cell_metadata=NucSeq.coembed@meta.data,
+  gene_metadata=genes
+)
+NucSeq_cds@reducedDims[['PCA']] <- NucSeq.coembed@reductions$pca@cell.embeddings
+NucSeq_cds <- align_cds(NucSeq_cds, preprocess_method='PCA', alignment_group = "Batch")
+NucSeq_cds <- reduce_dimension(NucSeq_cds, reduction_method = 'UMAP', preprocess_method = "Aligned")
+NucSeq_cds <- cluster_cells(NucSeq_cds, reduction_method='UMAP')
+
+
+
+NucSeq.rna <- readRDS(rna_path)
+NucSeq.atac <- readRDS(atac_path)
+
+# load ArchR project
+proj <- loadArchRProject(path = proj_path)
+proj@peakSet$site_name <- rownames(NucSeq.atac)
+
+# get list of unique groups, and get current group
+celltypes <- as.character(unique(NucSeq.rna@meta.data[[group_name]]))
+cur_celltype <- celltypes[celltype_index]
+
+# load MG cicero results:
+load(paste0(cicero_data_dir, cur_celltype, "_CCANs.rda"))
+load(paste0(cicero_data_dir, cur_celltype, "_cicero_connections.rda"))
+
+# subset seurat objects by microglia:
+cur_rna <- NucSeq.rna[,NucSeq.rna@meta.data[[group_name]] == cur_celltype]
+cur_atac <- NucSeq.atac[,NucSeq.atac@meta.data[[group_name]] == cur_celltype]
+
+# subset atac by samples that are also in RNA:
+cur_atac <- cur_atac[,cur_atac$Sample.ID %in% cur_rna$Sample.ID]
+cur_atac$Sample.ID <- factor(cur_atac$Sample.ID, levels=unique(cur_atac$Sample.ID))
+cur_rna$Sample.ID <- factor(cur_rna$Sample.ID, levels=unique(cur_atac$Sample.ID))
+
+# split objects by control & AD
+cur_atac_AD <- subset(cur_atac, Diagnosis == 'AD')
+cur_atac_Control <- subset(cur_atac, Diagnosis == 'Control')
+cur_rna_AD <- subset(cur_rna, Diagnosis == 'AD')
+cur_rna_Control <- subset(cur_rna, Diagnosis == 'Control')
+
+# set idents to sampleIDs:
+Idents(cur_atac_AD) <- cur_atac_AD$Sample.ID
+Idents(cur_atac_Control) <- cur_atac_Control$Sample.ID
+Idents(cur_rna_AD) <- cur_rna_AD$Sample.ID
+Idents(cur_rna_Control) <- cur_rna_Control$Sample.ID
+
+genes <- names(conns_list_AD)[names(conns_list_AD) %in% rownames(cur_rna_AD)]
+
+
+df <- data.frame()
+corr_list <- lapply(genes, function(cur_gene){
+  print(cur_gene)
+  # subset by cur_gene
+  cur_conns_AD <- conns_list_AD[[cur_gene]]
+  cur_conns_AD <- cur_conns_AD[!(cur_conns_AD$Peak2 %in% cur_conns_AD$Peak1),]
+  cur_conns_AD <- subset(cur_conns_AD, coaccess >= ccan_cutoff)
+
+  # skip this gene if there are no co-accessible connections
+  if(nrow(cur_conns_AD) == 0){return(data.frame())}
+
+  # get average exp and acc for this gene and peaks that are co-accessible
+  # average_acc <- average_acc_AD$peaks[as.character(unique(cur_conns_AD$Peak2)),]
+  average_acc <- average_acc_AD$peaks[as.character(cur_conns_AD$Peak2),]
+  average_exp <- average_exp_AD$RNA[cur_gene,]
+
+  # correlation between expression and accessibility:
+  cor_mat <- apply(average_acc, 1, function(x){
+    correlation <- cor.test(as.numeric(average_exp), as.numeric(x), method='pearson')
+    data.frame("pval"=correlation$p.value, "pcc"=correlation$estimate)
+  })
+
+  # collapse individual correlation dfs, add info
+  cor_df <- Reduce(rbind, cor_mat)
+  # cor_df$Peak <- rownames(average_acc)
+  # rownames(cor_df) <- cor_df$Peak
+  # cor_df$Peak <- sub('[.].*', "", cor_df$Peak)
+  # cor_df$target_gene <- cur_gene
+
+  cur_conns_AD$pcc <- cor_df$pcc
+  cur_conns_AD$pval <- cor_df$pval
+  cur_conns_AD
+})
+
+# combine into one df and remove incomplete entries:
+df <- Reduce(rbind, corr_list)
+df <- df[!is.na(df$pcc),]
+
+# # add column for peakType:
+# df$PeakType <- proj@peakSet$peakType[na.omit(match(df$Peak, proj@peakSet$site_name))]
+#
+# # compute FDR:
+# df$FDR <- p.adjust(df$pval, method='fdr')
+
+# write df to file:
+write.table(df, file=paste0(output_dir, cur_celltype, '_peak_gene_correlation_AD.csv'), sep=',', quote=FALSE, row.names=FALSE)
+
+
+
+```
+
